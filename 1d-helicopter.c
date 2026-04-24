@@ -42,6 +42,8 @@
 #include "mpu6050.h"
 #include "pt_cornell_rp2040_v1_4.h"
 
+// uS per frame
+#define FRAME_RATE 33000
 
 // Arrays in which raw measurements will be stored
 fix15 acceleration[3], gyro[3];
@@ -50,7 +52,7 @@ fix15 acceleration[3], gyro[3];
 char screentext[40];
 
 // draw speed
-int threshold = 10;
+int threshold = 10 ;
 
 // Some macros for max/min/abs
 #define min(a,b) ((a<b) ? a:b)
@@ -58,14 +60,11 @@ int threshold = 10;
 #define abs(a) ((a>0) ? a:-a)
 
 // semaphore
-static struct pt_sem vga_semaphore;
+static struct pt_sem vga_semaphore ;
 
-
-// PWM wrap value and clock divide value
-// For a CPU rate of 125 MHz, this gives
-// a PWM frequency of 1 kHz.
+// Some paramters for PWM
 #define WRAPVAL 5000
-#define CLKDIV 25.0f
+#define CLKDIV  25.0
 
 // GPIO we're using for PWM
 #define PWM_OUT 14
@@ -81,19 +80,21 @@ volatile int old_control ;
 void on_pwm_wrap() {
 
     // Clear the interrupt flag that brought us here
-    pwm_clear_irq(pwm_gpio_to_slice_num(PWM_OUT));
+    pwm_clear_irq(slice_num);
 
-    // // Update duty cycle
-    // if (control!=old_control) {
-    //     old_control = control ;
-    //     pwm_set_chan_level(slice_num, PWM_CHAN_A, control);
-    // }
+    // Update duty cycle
+    if (control!=old_control) {
+        old_control = control ;
+        pwm_set_chan_level(slice_num, PWM_CHAN_A, control);
+    }
 
     // Read the IMU
     // NOTE! This is in 15.16 fixed point. Accel in g's, gyro in deg/s
     // If you want these values in floating point, call fix2float15() on
     // the raw measurements.
     mpu6050_read_raw(acceleration, gyro);
+    // printf("on_pwm_wrap()\n");
+    // printf("acceleration = %f\n", fix2float15(acceleration[0]));
 
     // Signal VGA to draw
     PT_SEM_SIGNAL(pt, &vga_semaphore);
@@ -121,7 +122,7 @@ static PT_THREAD (protothread_vga(struct pt *pt))
     setTextSize(1) ;
     setTextColor(WHITE);
 
-    // Draw bottom plot
+    // Draw bottom plot - accelerometer
     drawHLine(75, 430, 5, CYAN) ;
     drawHLine(75, 355, 5, CYAN) ;
     drawHLine(75, 280, 5, CYAN) ;
@@ -136,7 +137,7 @@ static PT_THREAD (protothread_vga(struct pt *pt))
     setCursor(50, 425) ;
     writeString(screentext) ;
 
-    // Draw top plot
+    // Draw top plot - gyroscope
     drawHLine(75, 230, 5, CYAN) ;
     drawHLine(75, 155, 5, CYAN) ;
     drawHLine(75, 80, 5, CYAN) ;
@@ -188,43 +189,43 @@ static PT_THREAD (protothread_vga(struct pt *pt))
     PT_END(pt);
 }
 
+// User input thread
+static PT_THREAD (protothread_serial(struct pt *pt))
+{
+    PT_BEGIN(pt) ;
+    static int test_in ;
+    static char num_in[16];
+    static char c_in;
+    static int result;
+    static int num;
+    while(1) {
+        printf("Input a duty cycle (0-5000): ");
+        fflush(stdout); // Ensure the prompt prints immediately
+
+        if (fgets(num_in, sizeof(num_in), stdin) != NULL) {
+            // Check if the user just hit Enter (empty input)
+            if (num_in[0] == '\n') continue;
+
+            test_in = atoi(num_in);
+            printf("Duty cycle = %d\n", test_in);
+
+            if (test_in >= 0 && test_in <= 5000) {
+                control = test_in;
+                // break; // Uncomment if you want to exit the loop after success
+            } else {
+                printf("Error: Out of range.\n");
+            }
+        }
+    }
+    PT_END(pt) ;
+}
+
 // Entry point for core 1
 void core1_entry() {
     pt_add_thread(protothread_vga) ;
     pt_schedule_start ;
 }
 
-
-// User input thread
-// static PT_THREAD (protothread_serial(struct pt *pt))
-// {
-//     PT_BEGIN(pt) ;
-//     static int test_in ;
-//     static char num_in[16];
-//     static char c_in;
-//     static int result;
-//     static int num;
-//     while(1) {
-//         printf("Input a duty cycle (0-5000): ");
-//         fflush(stdout); // Ensure the prompt prints immediately
-
-//         if (fgets(num_in, sizeof(num_in), stdin) != NULL) {
-//             // Check if the user just hit Enter (empty input)
-//             if (num_in[0] == '\n') continue;
-
-//             test_in = atoi(num_in);
-//             printf("Duty cycle = %d\n", test_in);
-
-//             if (test_in >= 0 && test_in <= 5000) {
-//                 control = test_in;
-//                 // break; // Uncomment if you want to exit the loop after success
-//             } else {
-//                 printf("Error: Out of range.\n");
-//             }
-//         }
-//     }
-//     PT_END(pt) ;
-// }
 
 int main() {
 
@@ -254,10 +255,10 @@ int main() {
     ////////////////////////////////////////////////////////////////////////
     ///////////////////////// PWM CONFIGURATION ////////////////////////////
     ////////////////////////////////////////////////////////////////////////
-    // Tell GPIO PWM_OUT that it is allocated to the PWM
+    // Tell GPIO's that they allocated to the PWM
     gpio_set_function(PWM_OUT, GPIO_FUNC_PWM);
 
-    // Find out which PWM slice is connected to GPIO PWM_OUT (it's slice 2)
+    // Find out which PWM slice is connected to GPIO PWM_OUT (it's slice 7, same for 15)
     slice_num = pwm_gpio_to_slice_num(PWM_OUT);
 
     // Mask our slice's IRQ output into the PWM block's single interrupt line,
@@ -272,10 +273,12 @@ int main() {
     pwm_set_clkdiv(slice_num, CLKDIV) ;
 
     // This sets duty cycle
-    pwm_set_chan_level(slice_num, PWM_CHAN_A, 3125);
+    // pwm_set_chan_level(slice_num, PWM_CHAN_B, 0);
+    pwm_set_chan_level(slice_num, PWM_CHAN_A, 0);
 
     // Start the channel
     pwm_set_mask_enabled((1u << slice_num));
+
 
     ////////////////////////////////////////////////////////////////////////
     ///////////////////////////// ROCK AND ROLL ////////////////////////////
@@ -285,7 +288,7 @@ int main() {
     multicore_launch_core1(core1_entry);
 
     // start core 0
-    // pt_add_thread(protothread_serial) ;
-    // pt_schedule_start ;
+    pt_add_thread(protothread_serial);
+    pt_schedule_start ;
 
 }
