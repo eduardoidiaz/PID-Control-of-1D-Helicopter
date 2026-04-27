@@ -6,8 +6,8 @@
 
 #define ADDRESS 0x68
 #define I2C_CHAN i2c1
-#define SDA_PIN  6
-#define SCL_PIN  7
+#define SDA_PIN  26
+#define SCL_PIN  27
 #define I2C_BAUD_RATE 400000
 
 // Fixed point data type

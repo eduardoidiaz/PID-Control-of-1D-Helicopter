@@ -13,8 +13,8 @@
  *  - GPIO 4 ---> 330 ohm resistor ---> VGA Blue
  *  - GPIO 5 ---> 330 ohm resistor ---> VGA Red
  *  - RP2040 GND ---> VGA GND
- *  - GPIO 6 ---> MPU6050 SDA
- *  - GPIO 7 ---> MPU6050 SCL
+ *  - GPIO 26 ---> MPU6050 SDA
+ *  - GPIO 27 ---> MPU6050 SCL
  *  - 3.3v ---> MPU6050 VCC
  *  - RP2040 GND ---> MPU6050 GND
  *  - GPIO 14 ---> PWM output
@@ -49,10 +49,10 @@
 fix15 acceleration[3], gyro[3];
 
 // character array
-char screentext[40];
+char screentext[70];
 
 // draw speed
-int threshold = 10 ;
+int threshold = 15;
 
 // Some macros for max/min/abs
 #define min(a,b) ((a<b) ? a:b)
@@ -93,6 +93,9 @@ void on_pwm_wrap() {
     // If you want these values in floating point, call fix2float15() on
     // the raw measurements.
     mpu6050_read_raw(acceleration, gyro);
+
+    float angleXZ = (atan2(fix2float15(acceleration[0]), fix2float15(acceleration[2])) * 180.0 / 3.14) + 90; // [0, 180] degree range
+    printf("angleXZ = %f\n", angleXZ);
     // printf("on_pwm_wrap()\n");
     // printf("acceleration = %f\n", fix2float15(acceleration[0]));
 
@@ -122,11 +125,18 @@ static PT_THREAD (protothread_vga(struct pt *pt))
     setTextSize(1) ;
     setTextColor(WHITE);
 
+    sprintf(screentext, "X-axis (WHITE), Y-axis (RED), Z-axis (GREEN)");
+    setCursor(0, 0);
+    writeString(screentext) ;
+
     // Draw bottom plot - accelerometer
     drawHLine(75, 430, 5, CYAN) ;
     drawHLine(75, 355, 5, CYAN) ;
     drawHLine(75, 280, 5, CYAN) ;
     drawVLine(80, 280, 150, CYAN) ;
+    sprintf(screentext, "Accelerometer");
+    setCursor(0, 270);
+    writeString(screentext);
     sprintf(screentext, "0") ;
     setCursor(50, 350) ;
     writeString(screentext) ;
@@ -142,6 +152,9 @@ static PT_THREAD (protothread_vga(struct pt *pt))
     drawHLine(75, 155, 5, CYAN) ;
     drawHLine(75, 80, 5, CYAN) ;
     drawVLine(80, 80, 150, CYAN) ;
+    sprintf(screentext, "Gyroscope");
+    setCursor(0, 50);
+    writeString(screentext) ;
     sprintf(screentext, "0") ;
     setCursor(50, 150) ;
     writeString(screentext) ;
@@ -164,7 +177,7 @@ static PT_THREAD (protothread_vga(struct pt *pt))
             throttle = 0 ;
 
             // Erase a column
-            drawVLine(xcoord, 0, 480, BLACK) ;
+            drawVLine(xcoord, 10, 480, BLACK) ;
 
             // Draw bottom plot (multiply by 120 to scale from +/-2 to +/-250)
             drawPixel(xcoord, 430 - (int)(NewRange*((float)((fix2float15(acceleration[0])*120.0)-OldMin)/OldRange)), WHITE) ;
