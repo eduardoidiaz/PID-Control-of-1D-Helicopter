@@ -73,8 +73,15 @@ static struct pt_sem vga_semaphore ;
 uint slice_num ;
 
 // PWM duty cycle
-volatile int control ;
-volatile int old_control ;
+volatile int control;
+volatile int old_control;
+
+// Filtered accelerometer data
+volatile fix15 filtered_accel_x = 0;
+volatile fix15 filtered_accel_z = 0;
+fix15 alpha = float2fix15(0.15); // Smoothing factor
+
+fix15 complementary_angle = 0;
 
 // Interrupt service routine
 void on_pwm_wrap() {
@@ -94,8 +101,30 @@ void on_pwm_wrap() {
     // the raw measurements.
     mpu6050_read_raw(acceleration, gyro);
 
-    float angleXZ = (atan2(fix2float15(acceleration[0]), fix2float15(acceleration[2])) * 180.0 / 3.14) + 90; // [0, 180] degree range
-    printf("angleXZ = %f\n", angleXZ);
+    float raw_angleXZ = (atan2(fix2float15(acceleration[0]), fix2float15(acceleration[2])) * 180.0 / 3.14) + 90; // [0, 180] degree range
+    // printf("raw_angleXZ = %f\n", raw_angleXZ);
+
+    // Perform the accelerometer filtering
+    // filtered_accel_x = multfix15(alpha, acceleration[0]) + multfix15((float2fix15(1.0) - alpha), filtered_accel_x);
+    filtered_accel_x = filtered_accel_x + ((acceleration[0] - filtered_accel_x) >> 3);
+    // filtered_accel_z = multfix15(alpha, acceleration[2]) + multfix15((float2fix15(1.0) - alpha), filtered_accel_z);
+    filtered_accel_z = filtered_accel_z + ((acceleration[2] - filtered_accel_z) >> 3);
+
+    float filtered_angleXZ = (atan2(fix2float15(filtered_accel_x), fix2float15(filtered_accel_z)) * 180.0 / 3.14) + 90; // [0, 180] degree range
+    // printf("filtered_angleXZ = %f\n", filtered_angleXZ);
+
+    // Estimate the arm angle with a complementary filter
+    // No small angle approximation
+    fix15 accel_angle = multfix15(float2fix15(atan2(fix2float15(filtered_accel_x), fix2float15(filtered_accel_z))), oneeightyoverpi) + int2fix15(90);
+    // printf("accel_angle = %f\n", fix2float15(accel_angle));
+
+    // Gyro angle delta (measurement times timestep) (15.16 fixed point)
+    fix15 gyro_angle_delta = multfix15(gyro[1], zeropt001);
+
+    // Complementary angle (degrees - 15.16 fixed point)
+    complementary_angle = multfix15(complementary_angle - gyro_angle_delta, zeropt999) + multfix15(accel_angle, zeropt001);
+    // printf("complementary_angle = %f\n", fix2float15(complementary_angle));
+
     // printf("on_pwm_wrap()\n");
     // printf("acceleration = %f\n", fix2float15(acceleration[0]));
 
@@ -180,9 +209,9 @@ static PT_THREAD (protothread_vga(struct pt *pt))
             drawVLine(xcoord, 10, 480, BLACK) ;
 
             // Draw bottom plot (multiply by 120 to scale from +/-2 to +/-250)
-            drawPixel(xcoord, 430 - (int)(NewRange*((float)((fix2float15(acceleration[0])*120.0)-OldMin)/OldRange)), WHITE) ;
+            drawPixel(xcoord, 430 - (int)(NewRange*((float)((fix2float15(filtered_accel_x)*120.0)-OldMin)/OldRange)), WHITE) ;
             drawPixel(xcoord, 430 - (int)(NewRange*((float)((fix2float15(acceleration[1])*120.0)-OldMin)/OldRange)), RED) ;
-            drawPixel(xcoord, 430 - (int)(NewRange*((float)((fix2float15(acceleration[2])*120.0)-OldMin)/OldRange)), GREEN) ;
+            drawPixel(xcoord, 430 - (int)(NewRange*((float)((fix2float15(filtered_accel_z)*120.0)-OldMin)/OldRange)), GREEN) ;
 
             // Draw top plot
             drawPixel(xcoord, 230 - (int)(NewRange*((float)((fix2float15(gyro[0]))-OldMin)/OldRange)), WHITE) ;
