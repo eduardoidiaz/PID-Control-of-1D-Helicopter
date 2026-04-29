@@ -42,9 +42,6 @@
 #include "mpu6050.h"
 #include "pt_cornell_rp2040_v1_4.h"
 
-// uS per frame
-#define FRAME_RATE 33000
-
 // Arrays in which raw measurements will be stored
 fix15 acceleration[3], gyro[3];
 
@@ -75,13 +72,20 @@ uint slice_num ;
 // PWM duty cycle
 volatile int control;
 volatile int old_control;
+volatile int old_duty_cycle;
+volatile int duty_cycle;
 
 // Filtered accelerometer data
 volatile fix15 filtered_accel_x = 0;
 volatile fix15 filtered_accel_z = 0;
-fix15 alpha = float2fix15(0.15); // Smoothing factor
 
+// PID variables
+volatile uint desired_angle = 0;
 fix15 complementary_angle = 0;
+volatile fix15 angle_error = 0;
+volatile float Kp = 38.0;
+volatile float Ki = 0.0;
+volatile float Kd = 0.0;
 
 // Interrupt service routine
 void on_pwm_wrap() {
@@ -90,9 +94,11 @@ void on_pwm_wrap() {
     pwm_clear_irq(slice_num);
 
     // Update duty cycle
-    if (control!=old_control) {
-        old_control = control ;
-        pwm_set_chan_level(slice_num, PWM_CHAN_A, control);
+    if (duty_cycle != old_duty_cycle) {
+        // old_control = control ;
+        old_duty_cycle = duty_cycle;
+        // pwm_set_chan_level(slice_num, PWM_CHAN_A, control);
+        pwm_set_chan_level(slice_num, PWM_CHAN_A, duty_cycle);
     }
 
     // Read the IMU
@@ -105,9 +111,7 @@ void on_pwm_wrap() {
     // printf("raw_angleXZ = %f\n", raw_angleXZ);
 
     // Perform the accelerometer filtering
-    // filtered_accel_x = multfix15(alpha, acceleration[0]) + multfix15((float2fix15(1.0) - alpha), filtered_accel_x);
     filtered_accel_x = filtered_accel_x + ((acceleration[0] - filtered_accel_x) >> 3);
-    // filtered_accel_z = multfix15(alpha, acceleration[2]) + multfix15((float2fix15(1.0) - alpha), filtered_accel_z);
     filtered_accel_z = filtered_accel_z + ((acceleration[2] - filtered_accel_z) >> 3);
 
     float filtered_angleXZ = (atan2(fix2float15(filtered_accel_x), fix2float15(filtered_accel_z)) * 180.0 / 3.14) + 90; // [0, 180] degree range
@@ -125,8 +129,21 @@ void on_pwm_wrap() {
     complementary_angle = multfix15(complementary_angle - gyro_angle_delta, zeropt999) + multfix15(accel_angle, zeropt001);
     // printf("complementary_angle = %f\n", fix2float15(complementary_angle));
 
-    // printf("on_pwm_wrap()\n");
-    // printf("acceleration = %f\n", fix2float15(acceleration[0]));
+    // Proportional Term
+    if (desired_angle == 0) {
+        angle_error = 0;
+    } else {
+        angle_error = int2fix15(desired_angle) - complementary_angle;
+    }
+    printf("Angle error = %d\n", fix2int15(angle_error));
+
+    // duty_cycle =  (int) (Kp * angle_error);
+    duty_cycle = fix2int15(multfix15(float2fix15(Kp), angle_error));
+    if (duty_cycle < 0) {
+        duty_cycle = 0;
+    }
+    
+    printf("P Controller duty cycle = %d\n", duty_cycle);
 
     // Signal VGA to draw
     PT_SEM_SIGNAL(pt, &vga_semaphore);
@@ -147,6 +164,16 @@ static PT_THREAD (protothread_vga(struct pt *pt))
     static float OldMin = -250. ;
     static float OldMax = 250. ;
 
+    static float old_range_angle = 130.0;
+    static float new_range_angle = 150.0;
+    static float old_min_angle = 0.0;
+    static float old_max_angle = 130.0;
+
+    static float old_range_pwm = 5000.0;
+    static float new_range_pwm = 150.0;
+    static float old_min_pwm = 0.0;
+    static float old_max_pwm = 5000.0;
+
     // Control rate of drawing
     static int throttle ;
 
@@ -154,43 +181,79 @@ static PT_THREAD (protothread_vga(struct pt *pt))
     setTextSize(1) ;
     setTextColor(WHITE);
 
-    sprintf(screentext, "X-axis (WHITE), Y-axis (RED), Z-axis (GREEN)");
-    setCursor(0, 0);
-    writeString(screentext) ;
+    // sprintf(screentext, "X-axis (WHITE), Y-axis (RED), Z-axis (GREEN)");
+    // setCursor(0, 0);
+    // writeString(screentext) ;
 
     // Draw bottom plot - accelerometer
+    // drawHLine(75, 430, 5, CYAN) ;
+    // drawHLine(75, 355, 5, CYAN) ;
+    // drawHLine(75, 280, 5, CYAN) ;
+    // drawVLine(80, 280, 150, CYAN) ;
+    // sprintf(screentext, "Accelerometer");
+    // setCursor(0, 270);
+    // writeString(screentext);
+    // sprintf(screentext, "0") ;
+    // setCursor(50, 350) ;
+    // writeString(screentext) ;
+    // sprintf(screentext, "+2") ;
+    // setCursor(50, 280) ;
+    // writeString(screentext) ;
+    // sprintf(screentext, "-2") ;
+    // setCursor(50, 425) ;
+    // writeString(screentext) ;
+
+    // Draw bottom plot - Low-passed motor command signal
     drawHLine(75, 430, 5, CYAN) ;
     drawHLine(75, 355, 5, CYAN) ;
     drawHLine(75, 280, 5, CYAN) ;
     drawVLine(80, 280, 150, CYAN) ;
-    sprintf(screentext, "Accelerometer");
+    sprintf(screentext, "Motor Command");
     setCursor(0, 270);
     writeString(screentext);
-    sprintf(screentext, "0") ;
+    sprintf(screentext, "2500") ;
     setCursor(50, 350) ;
     writeString(screentext) ;
-    sprintf(screentext, "+2") ;
+    sprintf(screentext, "5000") ;
     setCursor(50, 280) ;
     writeString(screentext) ;
-    sprintf(screentext, "-2") ;
+    sprintf(screentext, "0") ;
     setCursor(50, 425) ;
     writeString(screentext) ;
 
     // Draw top plot - gyroscope
+    // drawHLine(75, 230, 5, CYAN) ;
+    // drawHLine(75, 155, 5, CYAN) ;
+    // drawHLine(75, 80, 5, CYAN) ;
+    // drawVLine(80, 80, 150, CYAN) ;
+    // sprintf(screentext, "Gyroscope");
+    // setCursor(0, 50);
+    // writeString(screentext) ;
+    // sprintf(screentext, "0") ;
+    // setCursor(50, 150) ;
+    // writeString(screentext) ;
+    // sprintf(screentext, "+250") ;
+    // setCursor(45, 75) ;
+    // writeString(screentext) ;
+    // sprintf(screentext, "-250") ;
+    // setCursor(45, 225) ;
+    // writeString(screentext) ;
+
+    // Draw top plot - Actual beam angle
     drawHLine(75, 230, 5, CYAN) ;
     drawHLine(75, 155, 5, CYAN) ;
     drawHLine(75, 80, 5, CYAN) ;
     drawVLine(80, 80, 150, CYAN) ;
-    sprintf(screentext, "Gyroscope");
+    sprintf(screentext, "Beam Angle");
     setCursor(0, 50);
     writeString(screentext) ;
-    sprintf(screentext, "0") ;
+    sprintf(screentext, "65") ;
     setCursor(50, 150) ;
     writeString(screentext) ;
-    sprintf(screentext, "+250") ;
+    sprintf(screentext, "130") ;
     setCursor(45, 75) ;
     writeString(screentext) ;
-    sprintf(screentext, "-250") ;
+    sprintf(screentext, "0") ;
     setCursor(45, 225) ;
     writeString(screentext) ;
     
@@ -209,14 +272,25 @@ static PT_THREAD (protothread_vga(struct pt *pt))
             drawVLine(xcoord, 10, 480, BLACK) ;
 
             // Draw bottom plot (multiply by 120 to scale from +/-2 to +/-250)
-            drawPixel(xcoord, 430 - (int)(NewRange*((float)((fix2float15(filtered_accel_x)*120.0)-OldMin)/OldRange)), WHITE) ;
-            drawPixel(xcoord, 430 - (int)(NewRange*((float)((fix2float15(acceleration[1])*120.0)-OldMin)/OldRange)), RED) ;
-            drawPixel(xcoord, 430 - (int)(NewRange*((float)((fix2float15(filtered_accel_z)*120.0)-OldMin)/OldRange)), GREEN) ;
+            // drawPixel(xcoord, 430 - (int)(NewRange*((float)((fix2float15(filtered_accel_x)*120.0)-OldMin)/OldRange)), WHITE) ;
+            // drawPixel(xcoord, 430 - (int)(NewRange*((float)((fix2float15(acceleration[1])*120.0)-OldMin)/OldRange)), RED) ;
+            // drawPixel(xcoord, 430 - (int)(NewRange*((float)((fix2float15(filtered_accel_z)*120.0)-OldMin)/OldRange)), GREEN) ;
+
+            // Draw bottom plot (multiply by 120 to scale from +/-2 to +/-250)
+            // drawPixel(xcoord, 430 - (int)(NewRange*((float)((fix2float15(filtered_accel_x)*120.0)-OldMin)/OldRange)), WHITE) ;
+            // drawPixel(xcoord, 430 - (int)(NewRange*((float)((fix2float15(acceleration[1])*120.0)-OldMin)/OldRange)), RED) ;
+            drawPixel(xcoord, 430 - (int)(new_range_pwm*((float)((float)duty_cycle)/old_range_pwm)), GREEN) ;
 
             // Draw top plot
-            drawPixel(xcoord, 230 - (int)(NewRange*((float)((fix2float15(gyro[0]))-OldMin)/OldRange)), WHITE) ;
-            drawPixel(xcoord, 230 - (int)(NewRange*((float)((fix2float15(gyro[1]))-OldMin)/OldRange)), RED) ;
-            drawPixel(xcoord, 230 - (int)(NewRange*((float)((fix2float15(gyro[2]))-OldMin)/OldRange)), GREEN) ;
+            // drawPixel(xcoord, 230 - (int)(NewRange*((float)((fix2float15(gyro[0]))-OldMin)/OldRange)), WHITE) ;
+            // drawPixel(xcoord, 230 - (int)(NewRange*((float)((fix2float15(gyro[1]))-OldMin)/OldRange)), RED) ;
+            // drawPixel(xcoord, 230 - (int)(NewRange*((float)((fix2float15(gyro[2]))-OldMin)/OldRange)), GREEN) ;
+
+            // Draw top plot
+            // drawPixel(xcoord, 230 - (int)(NewRange*((float)((fix2float15(gyro[0]))-OldMin)/OldRange)), WHITE) ;
+            // drawPixel(xcoord, 230 - (int)(NewRange*((float)((fix2float15(gyro[1]))-OldMin)/OldRange)), RED) ;
+            drawPixel(xcoord, 230 - (int)(new_range_angle*((float)(fix2float15(complementary_angle))/old_range_angle)), GREEN);
+
 
             // Update horizontal cursor
             if (xcoord < 609) {
@@ -231,6 +305,14 @@ static PT_THREAD (protothread_vga(struct pt *pt))
     PT_END(pt);
 }
 
+void print_parameters() {
+    printf("\nCurrent Parameters:\n");
+    printf("Desired Angle = %.2f deg\n", desired_angle);
+    printf("Kp = %.3f\n", Kp);
+    printf("Ki = %.3f\n", Ki);
+    printf("Kd = %.3f\n\n", Kd);
+}
+
 // User input thread
 static PT_THREAD (protothread_serial(struct pt *pt))
 {
@@ -241,7 +323,8 @@ static PT_THREAD (protothread_serial(struct pt *pt))
     static int result;
     static int num;
     while(1) {
-        printf("Input a duty cycle (0-5000): ");
+        // printf("Input a duty cycle (0-5000): ");
+        printf("Please input the desired angle for the 1D Helicopter (0-120):\n");
         fflush(stdout); // Ensure the prompt prints immediately
 
         if (fgets(num_in, sizeof(num_in), stdin) != NULL) {
@@ -249,10 +332,12 @@ static PT_THREAD (protothread_serial(struct pt *pt))
             if (num_in[0] == '\n') continue;
 
             test_in = atoi(num_in);
-            printf("Duty cycle = %d\n", test_in);
+            // printf("Duty cycle = %d\n", test_in);
+            printf("You entered: %d\n", test_in);
 
-            if (test_in >= 0 && test_in <= 5000) {
-                control = test_in;
+            if (test_in >= 0 && test_in <= 180) {
+                // control = test_in;
+                desired_angle = test_in;
                 // break; // Uncomment if you want to exit the loop after success
             } else {
                 printf("Error: Out of range.\n");
