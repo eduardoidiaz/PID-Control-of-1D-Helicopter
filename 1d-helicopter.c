@@ -1,9 +1,11 @@
 /**
  * Eduardo Diaz
- * PWM demo code with serial input
  * 
- * This demonstration sets a PWM duty cycle to a
- * user-specified value.
+ * PID control of 1-D Helicopter with serial input to adjust PID values and the desired angle of the beam.
+ * Connecting to a VGA display allows for a visual look at the actual beam angle and 
+ * the motor command signal.
+ * 
+ * Inspired by https://vanhunteradams.com/Pico/Helicopter/Helicopter.html
  * 
  * HARDWARE CONNECTIONS
  *  - GPIO 0 ---> VGA Hsync
@@ -42,9 +44,6 @@
 #include "mpu6050.h"
 #include "pt_cornell_rp2040_v1_4.h"
 
-// uS per frame
-#define FRAME_RATE 33000
-
 // Arrays in which raw measurements will be stored
 fix15 acceleration[3], gyro[3];
 
@@ -73,8 +72,26 @@ static struct pt_sem vga_semaphore ;
 uint slice_num ;
 
 // PWM duty cycle
-volatile int control ;
-volatile int old_control ;
+volatile int old_duty_cycle;
+volatile int duty_cycle;
+
+// Filtered accelerometer data
+volatile fix15 filtered_accel_x = 0;
+volatile fix15 filtered_accel_z = 0;
+
+// PID variables
+volatile uint desired_angle = 0;
+volatile fix15 complementary_angle = 0;
+volatile fix15 angle_error = 0;
+volatile fix15 prev_angle_error = 0;
+volatile fix15 integral = 0;
+volatile float Kp = 165.0;
+volatile float Ki = 45.6;
+volatile float Kd = 41000.0;
+
+volatile fix15 accel_angle = 0;
+volatile fix15 gyro_angle_delta = 0;
+
 
 // Interrupt service routine
 void on_pwm_wrap() {
@@ -82,22 +99,63 @@ void on_pwm_wrap() {
     // Clear the interrupt flag that brought us here
     pwm_clear_irq(slice_num);
 
-    // Update duty cycle
-    if (control!=old_control) {
-        old_control = control ;
-        pwm_set_chan_level(slice_num, PWM_CHAN_A, control);
-    }
-
     // Read the IMU
     // NOTE! This is in 15.16 fixed point. Accel in g's, gyro in deg/s
     // If you want these values in floating point, call fix2float15() on
     // the raw measurements.
     mpu6050_read_raw(acceleration, gyro);
 
-    float angleXZ = (atan2(fix2float15(acceleration[0]), fix2float15(acceleration[2])) * 180.0 / 3.14) + 90; // [0, 180] degree range
-    printf("angleXZ = %f\n", angleXZ);
-    // printf("on_pwm_wrap()\n");
-    // printf("acceleration = %f\n", fix2float15(acceleration[0]));
+    // Perform the accelerometer filtering
+    filtered_accel_x = filtered_accel_x + ((acceleration[0] - filtered_accel_x) >> 5);
+    filtered_accel_z = filtered_accel_z + ((acceleration[2] - filtered_accel_z) >> 5);
+
+    // Estimate the arm angle with a complementary filter
+    // No small angle approximation
+    // Initial hanging down position set to 0 degrees
+    accel_angle = multfix15(float2fix15(atan2(fix2float15(filtered_accel_x), fix2float15(filtered_accel_z))), oneeightyoverpi) + int2fix15(96);
+    // printf("accel_angle = %f\n", fix2float15(accel_angle));
+
+    // Gyro angle delta (measurement times timestep) (15.16 fixed point)
+    gyro_angle_delta = multfix15(gyro[1], zeropt001);
+
+    // Complementary angle (degrees - 15.16 fixed point)
+    complementary_angle = multfix15(complementary_angle - gyro_angle_delta, zeropt999) + multfix15(accel_angle, zeropt001);
+    // printf("complementary_angle = %f\n", fix2float15(complementary_angle));
+
+    // No error at rest
+    if (desired_angle == 0) {
+        angle_error = 0;
+        integral = 0;
+    } else {
+        angle_error = int2fix15(desired_angle) - complementary_angle;
+    }
+    // printf("Angle error = %d\n", fix2int15(angle_error));
+
+    // Proportional Term
+    fix15 p_term = multfix15(float2fix15(Kp), angle_error);
+
+    // Integral term
+    integral += multfix15(angle_error, zeropt001);
+    fix15 i_term = multfix15(float2fix15(Ki), integral);
+
+    // Derivative term
+    fix15 derivative = divfix((angle_error - prev_angle_error), zeropt001);
+
+    fix15 d_term = multfix15(float2fix15(Kd), derivative);
+
+    // Save error
+    prev_angle_error = angle_error;
+
+    // Total PID output
+    duty_cycle = fix2int15(p_term + i_term + d_term);
+
+    if (duty_cycle < 0) {
+        duty_cycle = 0;
+    }
+
+    pwm_set_chan_level(slice_num, PWM_CHAN_A, duty_cycle);
+    
+    // printf("P Controller duty cycle = %d\n", duty_cycle);
 
     // Signal VGA to draw
     PT_SEM_SIGNAL(pt, &vga_semaphore);
@@ -118,6 +176,16 @@ static PT_THREAD (protothread_vga(struct pt *pt))
     static float OldMin = -250. ;
     static float OldMax = 250. ;
 
+    static float old_range_angle = 130.0;
+    static float new_range_angle = 150.0;
+    static float old_min_angle = 0.0;
+    static float old_max_angle = 130.0;
+
+    static float old_range_pwm = 5000.0;
+    static float new_range_pwm = 150.0;
+    static float old_min_pwm = 0.0;
+    static float old_max_pwm = 5000.0;
+
     // Control rate of drawing
     static int throttle ;
 
@@ -125,43 +193,47 @@ static PT_THREAD (protothread_vga(struct pt *pt))
     setTextSize(1) ;
     setTextColor(WHITE);
 
-    sprintf(screentext, "X-axis (WHITE), Y-axis (RED), Z-axis (GREEN)");
+    sprintf(screentext, "Current Beam Angle = ");
     setCursor(0, 0);
-    writeString(screentext) ;
+    writeString(screentext);
 
-    // Draw bottom plot - accelerometer
+    sprintf(screentext, "Angle Error = ");
+    setCursor(0, 9);
+    writeString(screentext);
+
+    // Draw bottom plot - Low-passed motor command signal
     drawHLine(75, 430, 5, CYAN) ;
     drawHLine(75, 355, 5, CYAN) ;
     drawHLine(75, 280, 5, CYAN) ;
     drawVLine(80, 280, 150, CYAN) ;
-    sprintf(screentext, "Accelerometer");
+    sprintf(screentext, "Motor Command");
     setCursor(0, 270);
     writeString(screentext);
-    sprintf(screentext, "0") ;
+    sprintf(screentext, "2500") ;
     setCursor(50, 350) ;
     writeString(screentext) ;
-    sprintf(screentext, "+2") ;
+    sprintf(screentext, "5000") ;
     setCursor(50, 280) ;
     writeString(screentext) ;
-    sprintf(screentext, "-2") ;
+    sprintf(screentext, "0") ;
     setCursor(50, 425) ;
     writeString(screentext) ;
 
-    // Draw top plot - gyroscope
+    // Draw top plot - Actual beam angle
     drawHLine(75, 230, 5, CYAN) ;
     drawHLine(75, 155, 5, CYAN) ;
     drawHLine(75, 80, 5, CYAN) ;
     drawVLine(80, 80, 150, CYAN) ;
-    sprintf(screentext, "Gyroscope");
+    sprintf(screentext, "Beam Angle");
     setCursor(0, 50);
     writeString(screentext) ;
-    sprintf(screentext, "0") ;
+    sprintf(screentext, "65") ;
     setCursor(50, 150) ;
     writeString(screentext) ;
-    sprintf(screentext, "+250") ;
+    sprintf(screentext, "130") ;
     setCursor(45, 75) ;
     writeString(screentext) ;
-    sprintf(screentext, "-250") ;
+    sprintf(screentext, "0") ;
     setCursor(45, 225) ;
     writeString(screentext) ;
     
@@ -176,18 +248,31 @@ static PT_THREAD (protothread_vga(struct pt *pt))
             // Zero drawspeed controller
             throttle = 0 ;
 
+            // drawRect(126, 0, 4, 3, RED);
+
+            // Update current beam angle
+            drawRect(126, 0, 36, 8, BLACK);
+            fillRect(126, 0, 36, 8, BLACK);
+            setCursor(126, 0);
+            sprintf(screentext, "%.1f", fix2float15(complementary_angle));
+            writeString(screentext);
+
+            // Update current angle error
+            drawRect(90, 9, 36, 8, BLACK);
+            fillRect(90, 9, 36, 8, BLACK);
+            setCursor(90, 9);
+            sprintf(screentext, "%.1f", fix2float15(angle_error));
+            writeString(screentext);
+
             // Erase a column
             drawVLine(xcoord, 10, 480, BLACK) ;
 
-            // Draw bottom plot (multiply by 120 to scale from +/-2 to +/-250)
-            drawPixel(xcoord, 430 - (int)(NewRange*((float)((fix2float15(acceleration[0])*120.0)-OldMin)/OldRange)), WHITE) ;
-            drawPixel(xcoord, 430 - (int)(NewRange*((float)((fix2float15(acceleration[1])*120.0)-OldMin)/OldRange)), RED) ;
-            drawPixel(xcoord, 430 - (int)(NewRange*((float)((fix2float15(acceleration[2])*120.0)-OldMin)/OldRange)), GREEN) ;
+            // Draw bottom plot - Low-passed PWM motor command signal
+            drawPixel(xcoord, 430 - (int)(new_range_pwm*((float)((float)duty_cycle)/old_range_pwm)), GREEN) ;
 
-            // Draw top plot
-            drawPixel(xcoord, 230 - (int)(NewRange*((float)((fix2float15(gyro[0]))-OldMin)/OldRange)), WHITE) ;
-            drawPixel(xcoord, 230 - (int)(NewRange*((float)((fix2float15(gyro[1]))-OldMin)/OldRange)), RED) ;
-            drawPixel(xcoord, 230 - (int)(NewRange*((float)((fix2float15(gyro[2]))-OldMin)/OldRange)), GREEN) ;
+            // Draw top plot - Actual beam angle
+            drawPixel(xcoord, 230 - (int)(new_range_angle*((float)(fix2float15(complementary_angle))/old_range_angle)), GREEN);
+
 
             // Update horizontal cursor
             if (xcoord < 609) {
@@ -202,32 +287,67 @@ static PT_THREAD (protothread_vga(struct pt *pt))
     PT_END(pt);
 }
 
+void print_parameters() {
+    printf("\nCurrent Parameters:\n");
+    printf("Desired Angle = %d deg\n", desired_angle);
+    printf("Kp = %.3f\n", Kp);
+    printf("Ki = %.3f\n", Ki);
+    printf("Kd = %.3f\n\n", Kd);
+}
+
 // User input thread
 static PT_THREAD (protothread_serial(struct pt *pt))
 {
     PT_BEGIN(pt) ;
-    static int test_in ;
-    static char num_in[16];
-    static char c_in;
-    static int result;
-    static int num;
+    static char input[64];
     while(1) {
-        printf("Input a duty cycle (0-5000): ");
-        fflush(stdout); // Ensure the prompt prints immediately
 
-        if (fgets(num_in, sizeof(num_in), stdin) != NULL) {
-            // Check if the user just hit Enter (empty input)
-            if (num_in[0] == '\n') continue;
+        print_parameters();
 
-            test_in = atoi(num_in);
-            printf("Duty cycle = %d\n", test_in);
+        printf("Select parameter to change:\n");
+        printf("1 -> Desired Angle\n");
+        printf("2 -> Kp\n");
+        printf("3 -> Ki\n");
+        printf("4 -> Kd\n");
+        printf("q -> Quit\n");
+        printf("Choice: ");
 
-            if (test_in >= 0 && test_in <= 5000) {
-                control = test_in;
-                // break; // Uncomment if you want to exit the loop after success
-            } else {
-                printf("Error: Out of range.\n");
-            }
+        fgets(input, sizeof(input), stdin);
+
+        // Quit menu
+        if (input[0] == 'q') {
+            break;
+        }
+
+        switch (input[0]) {
+
+            case '1':
+                printf("Enter new desired angle: ");
+                fgets(input, sizeof(input), stdin);
+                desired_angle = atoi(input);
+                break;
+
+            case '2':
+                printf("Enter new Kp: ");
+                fgets(input, sizeof(input), stdin);
+                Kp = atof(input);
+                break;
+
+            case '3':
+                printf("Enter new Ki: ");
+                fgets(input, sizeof(input), stdin);
+                Ki = atof(input);
+                break;
+
+            case '4':
+                printf("Enter new Kd: ");
+                fgets(input, sizeof(input), stdin);
+                Kd = atof(input);
+                break;
+
+            default:
+                printf("Invalid selection\n");
+                break;
         }
     }
     PT_END(pt) ;
