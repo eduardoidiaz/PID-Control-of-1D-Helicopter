@@ -1,9 +1,11 @@
 /**
  * Eduardo Diaz
- * PWM demo code with serial input
  * 
- * This demonstration sets a PWM duty cycle to a
- * user-specified value.
+ * PID control of 1-D Helicopter with serial input to adjust PID values and the desired angle of the beam.
+ * Connecting to a VGA display allows for a visual look at the actual beam angle and 
+ * the motor command signal.
+ * 
+ * Inspired by https://vanhunteradams.com/Pico/Helicopter/Helicopter.html
  * 
  * HARDWARE CONNECTIONS
  *  - GPIO 0 ---> VGA Hsync
@@ -70,8 +72,6 @@ static struct pt_sem vga_semaphore ;
 uint slice_num ;
 
 // PWM duty cycle
-volatile int control;
-volatile int old_control;
 volatile int old_duty_cycle;
 volatile int duty_cycle;
 
@@ -81,11 +81,17 @@ volatile fix15 filtered_accel_z = 0;
 
 // PID variables
 volatile uint desired_angle = 0;
-fix15 complementary_angle = 0;
+volatile fix15 complementary_angle = 0;
 volatile fix15 angle_error = 0;
-volatile float Kp = 38.0;
-volatile float Ki = 0.0;
-volatile float Kd = 0.0;
+volatile fix15 prev_angle_error = 0;
+volatile fix15 integral = 0;
+volatile float Kp = 165.0;
+volatile float Ki = 45.6;
+volatile float Kd = 41000.0;
+
+volatile fix15 accel_angle = 0;
+volatile fix15 gyro_angle_delta = 0;
+
 
 // Interrupt service routine
 void on_pwm_wrap() {
@@ -93,55 +99,61 @@ void on_pwm_wrap() {
     // Clear the interrupt flag that brought us here
     pwm_clear_irq(slice_num);
 
-    // Update duty cycle
-    if (duty_cycle != old_duty_cycle) {
-        // old_control = control ;
-        old_duty_cycle = duty_cycle;
-        // pwm_set_chan_level(slice_num, PWM_CHAN_A, control);
-        pwm_set_chan_level(slice_num, PWM_CHAN_A, duty_cycle);
-    }
-
     // Read the IMU
     // NOTE! This is in 15.16 fixed point. Accel in g's, gyro in deg/s
     // If you want these values in floating point, call fix2float15() on
     // the raw measurements.
     mpu6050_read_raw(acceleration, gyro);
 
-    float raw_angleXZ = (atan2(fix2float15(acceleration[0]), fix2float15(acceleration[2])) * 180.0 / 3.14) + 90; // [0, 180] degree range
-    // printf("raw_angleXZ = %f\n", raw_angleXZ);
-
     // Perform the accelerometer filtering
-    filtered_accel_x = filtered_accel_x + ((acceleration[0] - filtered_accel_x) >> 3);
-    filtered_accel_z = filtered_accel_z + ((acceleration[2] - filtered_accel_z) >> 3);
-
-    float filtered_angleXZ = (atan2(fix2float15(filtered_accel_x), fix2float15(filtered_accel_z)) * 180.0 / 3.14) + 90; // [0, 180] degree range
-    // printf("filtered_angleXZ = %f\n", filtered_angleXZ);
+    filtered_accel_x = filtered_accel_x + ((acceleration[0] - filtered_accel_x) >> 5);
+    filtered_accel_z = filtered_accel_z + ((acceleration[2] - filtered_accel_z) >> 5);
 
     // Estimate the arm angle with a complementary filter
     // No small angle approximation
-    fix15 accel_angle = multfix15(float2fix15(atan2(fix2float15(filtered_accel_x), fix2float15(filtered_accel_z))), oneeightyoverpi) + int2fix15(90);
+    // Initial hanging down position set to 0 degrees
+    accel_angle = multfix15(float2fix15(atan2(fix2float15(filtered_accel_x), fix2float15(filtered_accel_z))), oneeightyoverpi) + int2fix15(96);
     // printf("accel_angle = %f\n", fix2float15(accel_angle));
 
     // Gyro angle delta (measurement times timestep) (15.16 fixed point)
-    fix15 gyro_angle_delta = multfix15(gyro[1], zeropt001);
+    gyro_angle_delta = multfix15(gyro[1], zeropt001);
 
     // Complementary angle (degrees - 15.16 fixed point)
     complementary_angle = multfix15(complementary_angle - gyro_angle_delta, zeropt999) + multfix15(accel_angle, zeropt001);
     // printf("complementary_angle = %f\n", fix2float15(complementary_angle));
 
-    // Proportional Term
+    // No error at rest
     if (desired_angle == 0) {
         angle_error = 0;
+        integral = 0;
     } else {
         angle_error = int2fix15(desired_angle) - complementary_angle;
     }
     // printf("Angle error = %d\n", fix2int15(angle_error));
 
-    // duty_cycle =  (int) (Kp * angle_error);
-    duty_cycle = fix2int15(multfix15(float2fix15(Kp), angle_error));
+    // Proportional Term
+    fix15 p_term = multfix15(float2fix15(Kp), angle_error);
+
+    // Integral term
+    integral += multfix15(angle_error, zeropt001);
+    fix15 i_term = multfix15(float2fix15(Ki), integral);
+
+    // Derivative term
+    fix15 derivative = divfix((angle_error - prev_angle_error), zeropt001);
+
+    fix15 d_term = multfix15(float2fix15(Kd), derivative);
+
+    // Save error
+    prev_angle_error = angle_error;
+
+    // Total PID output
+    duty_cycle = fix2int15(p_term + i_term + d_term);
+
     if (duty_cycle < 0) {
         duty_cycle = 0;
     }
+
+    pwm_set_chan_level(slice_num, PWM_CHAN_A, duty_cycle);
     
     // printf("P Controller duty cycle = %d\n", duty_cycle);
 
@@ -180,6 +192,14 @@ static PT_THREAD (protothread_vga(struct pt *pt))
     // Draw the static aspects of the display
     setTextSize(1) ;
     setTextColor(WHITE);
+
+    sprintf(screentext, "Current Beam Angle = ");
+    setCursor(0, 0);
+    writeString(screentext);
+
+    sprintf(screentext, "Angle Error = ");
+    setCursor(0, 9);
+    writeString(screentext);
 
     // Draw bottom plot - Low-passed motor command signal
     drawHLine(75, 430, 5, CYAN) ;
@@ -227,6 +247,22 @@ static PT_THREAD (protothread_vga(struct pt *pt))
         if (throttle >= threshold) { 
             // Zero drawspeed controller
             throttle = 0 ;
+
+            // drawRect(126, 0, 4, 3, RED);
+
+            // Update current beam angle
+            drawRect(126, 0, 36, 8, BLACK);
+            fillRect(126, 0, 36, 8, BLACK);
+            setCursor(126, 0);
+            sprintf(screentext, "%.1f", fix2float15(complementary_angle));
+            writeString(screentext);
+
+            // Update current angle error
+            drawRect(90, 9, 36, 8, BLACK);
+            fillRect(90, 9, 36, 8, BLACK);
+            setCursor(90, 9);
+            sprintf(screentext, "%.1f", fix2float15(angle_error));
+            writeString(screentext);
 
             // Erase a column
             drawVLine(xcoord, 10, 480, BLACK) ;
