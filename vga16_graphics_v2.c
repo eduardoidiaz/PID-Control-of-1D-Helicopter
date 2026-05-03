@@ -579,6 +579,10 @@ inline void setTextWrap(char w) {
 
 
 void tft_write(unsigned char c){
+  // UTF-8 degree symbol handling: 
+  // It sends 0xC2 then 0xB0. We ignore 0xC2 and map 0xB0 to 127.
+  if (c == 0xC2) return; 
+  if (c == 0xB0) c = 127; 
   if (c == '\n') {
     cursor_y += textsize*8;
     cursor_x  = 0;

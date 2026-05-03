@@ -68,12 +68,20 @@ static struct pt_sem vga_semaphore ;
 // GPIO we're using for PWM
 #define PWM_OUT 14
 
+// GPIO ISR PIN
+#define ISR_PIN 9
+
+// Wait time for button debounce (currently mitigates noisy signal issue)
+#define DEBOUNCE_US 30000
+
+
 // Variable to hold PWM slice number
 uint slice_num ;
 
 // PWM duty cycle
 volatile int old_duty_cycle;
 volatile int duty_cycle;
+volatile int filtered_duty_cycle = 0; // Goes out to VGA Display (Looks better filtered)
 
 // Filtered accelerometer data
 volatile fix15 filtered_accel_x = 0;
@@ -91,6 +99,11 @@ volatile float Kd = 41000.0;
 
 volatile fix15 accel_angle = 0;
 volatile fix15 gyro_angle_delta = 0;
+
+volatile bool run_demo = false;
+
+volatile int interrupt_count = 0;
+volatile uint32_t last_irq_time = 0;
 
 
 // Interrupt service routine
@@ -148,6 +161,8 @@ void on_pwm_wrap() {
 
     // Total PID output
     duty_cycle = fix2int15(p_term + i_term + d_term);
+    // Perform the duty_cycle filtering
+    filtered_duty_cycle = filtered_duty_cycle + ((duty_cycle - filtered_duty_cycle) >> 8);
 
     if (duty_cycle < 0) {
         duty_cycle = 0;
@@ -178,13 +193,9 @@ static PT_THREAD (protothread_vga(struct pt *pt))
 
     static float old_range_angle = 130.0;
     static float new_range_angle = 150.0;
-    static float old_min_angle = 0.0;
-    static float old_max_angle = 130.0;
 
     static float old_range_pwm = 5000.0;
     static float new_range_pwm = 150.0;
-    static float old_min_pwm = 0.0;
-    static float old_max_pwm = 5000.0;
 
     // Control rate of drawing
     static int throttle ;
@@ -227,13 +238,13 @@ static PT_THREAD (protothread_vga(struct pt *pt))
     sprintf(screentext, "Beam Angle");
     setCursor(0, 50);
     writeString(screentext) ;
-    sprintf(screentext, "65") ;
+    sprintf(screentext, "65°") ;
     setCursor(50, 150) ;
     writeString(screentext) ;
-    sprintf(screentext, "130") ;
+    sprintf(screentext, "130°") ;
     setCursor(45, 75) ;
     writeString(screentext) ;
-    sprintf(screentext, "0") ;
+    sprintf(screentext, "0°") ;
     setCursor(45, 225) ;
     writeString(screentext) ;
     
@@ -254,21 +265,23 @@ static PT_THREAD (protothread_vga(struct pt *pt))
             drawRect(126, 0, 36, 8, BLACK);
             fillRect(126, 0, 36, 8, BLACK);
             setCursor(126, 0);
-            sprintf(screentext, "%.1f", fix2float15(complementary_angle));
+            sprintf(screentext, "%.1f°", fix2float15(complementary_angle));
             writeString(screentext);
 
             // Update current angle error
             drawRect(90, 9, 36, 8, BLACK);
             fillRect(90, 9, 36, 8, BLACK);
             setCursor(90, 9);
-            sprintf(screentext, "%.1f", fix2float15(angle_error));
+            sprintf(screentext, "%.1f°", fix2float15(angle_error));
             writeString(screentext);
 
             // Erase a column
             drawVLine(xcoord, 10, 480, BLACK) ;
 
             // Draw bottom plot - Low-passed PWM motor command signal
-            drawPixel(xcoord, 430 - (int)(new_range_pwm*((float)((float)duty_cycle)/old_range_pwm)), GREEN) ;
+            // drawPixel(xcoord, 430 - (int)(new_range_pwm*((float)((float)duty_cycle)/old_range_pwm)), GREEN) ;
+            drawPixel(xcoord, 430 - (int)(new_range_pwm*((float)((float)filtered_duty_cycle)/old_range_pwm)), GREEN);
+
 
             // Draw top plot - Actual beam angle
             drawPixel(xcoord, 230 - (int)(new_range_angle*((float)(fix2float15(complementary_angle))/old_range_angle)), GREEN);
@@ -295,62 +308,212 @@ void print_parameters() {
     printf("Kd = %.3f\n\n", Kd);
 }
 
-// User input thread
-static PT_THREAD (protothread_serial(struct pt *pt))
-{
-    PT_BEGIN(pt) ;
-    static char input[64];
-    while(1) {
+void ask_user_input() {
+    printf("Select parameter to change:\n");
+    printf("1 -> Desired Angle\n");
+    printf("2 -> Kp\n");
+    printf("3 -> Ki\n");
+    printf("4 -> Kd\n");
+    printf("5 -> Demo Sequence\n");
+    printf("q -> Quit\n");
+}
 
-        print_parameters();
+#define MAX_CMD_LEN 64
+// ==================================================
+// === User input thread
+// ==================================================
+static PT_THREAD(protothread_serial(struct pt *pt)) {
+    PT_BEGIN(pt);
 
-        printf("Select parameter to change:\n");
-        printf("1 -> Desired Angle\n");
-        printf("2 -> Kp\n");
-        printf("3 -> Ki\n");
-        printf("4 -> Kd\n");
-        printf("q -> Quit\n");
-        printf("Choice: ");
+    static char input[MAX_CMD_LEN];
+    static int index;
+    static int c;
 
-        fgets(input, sizeof(input), stdin);
+    // state variables
+    static int menu_state;
+    static int selected_param;
 
-        // Quit menu
-        if (input[0] == 'q') {
-            break;
+    index = 0;
+    menu_state = 0;
+
+    while (1) {
+
+        // =========================
+        // MAIN MENU
+        // =========================
+        if (menu_state == 0) {
+
+            print_parameters();
+            ask_user_input();
+
+            menu_state = 1;
         }
 
-        switch (input[0]) {
+        // =========================
+        // GET USER INPUT
+        // =========================
+        c = getchar_timeout_us(0);
 
-            case '1':
-                printf("Enter new desired angle: ");
-                fgets(input, sizeof(input), stdin);
-                desired_angle = atoi(input);
-                break;
+        if (c != PICO_ERROR_TIMEOUT) {
 
-            case '2':
-                printf("Enter new Kp: ");
-                fgets(input, sizeof(input), stdin);
-                Kp = atof(input);
-                break;
+            // ENTER
+            if (c == '\r' || c == '\n') {
 
-            case '3':
-                printf("Enter new Ki: ");
-                fgets(input, sizeof(input), stdin);
-                Ki = atof(input);
-                break;
+                input[index] = '\0';
 
-            case '4':
-                printf("Enter new Kd: ");
-                fgets(input, sizeof(input), stdin);
-                Kd = atof(input);
-                break;
+                printf("\n");
 
-            default:
-                printf("Invalid selection\n");
-                break;
+                // =========================
+                // MENU COMMAND MODE
+                // =========================
+                if (menu_state == 1) {
+
+                    if (!strcmp(input, "1")) {
+
+                        selected_param = 1;
+
+                        printf("Enter desired angle: ");
+
+                        menu_state = 2;
+                    } else if (!strcmp(input, "2")) {
+
+                        selected_param = 2;
+
+                        printf("Enter Kp: ");
+
+                        menu_state = 2;
+                    } else if (!strcmp(input, "3")) {
+
+                        selected_param = 3;
+
+                        printf("Enter Ki: ");
+
+                        menu_state = 2;
+                    } else if (!strcmp(input, "4")) {
+
+                        selected_param = 4;
+
+                        printf("Enter Kd: ");
+
+                        menu_state = 2;
+                    } else if (!strcmp(input, "5")) {
+
+                        run_demo = true;
+
+                        menu_state = 0;
+                    } else if (!strcmp(input, "q")) {
+
+                        printf("Quit selected\n");
+
+                        menu_state = 0;
+                    }
+
+                    else {
+
+                        printf("Invalid selection\n");
+
+                        menu_state = 0;
+                    }
+                }
+
+                // =========================
+                // VALUE ENTRY MODE
+                // =========================
+                else if (menu_state == 2) {
+
+                    switch (selected_param) {
+                        case 1:
+                            desired_angle = atoi(input);
+                            break;
+                        case 2:
+                            Kp = atof(input);
+                            break;
+                        case 3:
+                            Ki = atof(input);
+                            break;
+                        case 4:
+                            Kd = atof(input);
+                            break;
+                    }
+
+                    printf("Parameter updated!\n");
+
+                    menu_state = 0;
+                }
+
+                // clear input buffer
+                index = 0;
+            }
+
+            // BACKSPACE
+            else if ((c == 8 || c == 127) && index > 0) {
+
+                index--;
+
+                printf("\b \b");
+            }
+
+            // NORMAL CHARACTER
+            else if (index < MAX_CMD_LEN - 1) {
+
+                input[index++] = c;
+
+                putchar(c);
+            }
         }
+
+        PT_YIELD(pt);
     }
-    PT_END(pt) ;
+
+    PT_END(pt);
+}
+
+// ==================================================
+// === GPIO Interrupt Thread
+// ==================================================
+static PT_THREAD(protothread_gpio(struct pt *pt)) {
+    PT_BEGIN(pt);
+
+    while (1) {
+
+        if (run_demo) {
+
+            run_demo = false;
+
+            printf("\nInterrupt Triggered! (interrupt_count = %d)\n", interrupt_count);
+
+            printf("Starting Demo!\n");
+
+            printf("Horizontal!\n");
+            desired_angle = 90;
+            sleep_ms(5000);
+
+            printf("30° Above Horizontal!\n");
+            desired_angle = 120;
+            sleep_ms(5000);
+
+            printf("30° Below Horizontal!\n");
+            desired_angle = 60;
+            sleep_ms(5000);
+
+            // Rest lever arm slowly
+            desired_angle = 30;
+            sleep_ms(2000);
+            desired_angle = 15;
+            sleep_ms(2000);
+            desired_angle = 0;
+            sleep_ms(2000);
+
+            printf("Demo Finished!\n");
+
+            print_parameters();
+            ask_user_input();
+        }
+
+        PT_YIELD(pt);
+    }
+
+    PT_END(pt);
 }
 
 // Entry point for core 1
@@ -359,6 +522,17 @@ void core1_entry() {
     pt_schedule_start ;
 }
 
+void gpio_callback() {
+
+    uint32_t now = time_us_32();
+
+    if (now - last_irq_time < DEBOUNCE_US) return;
+
+    last_irq_time = now;
+
+    interrupt_count++;
+    run_demo = true;
+}
 
 int main() {
 
@@ -369,7 +543,13 @@ int main() {
     stdio_init_all();
 
     // Initialize VGA
-    initVGA() ;
+    initVGA();
+
+    gpio_init(ISR_PIN);
+    gpio_set_dir(ISR_PIN, GPIO_IN);
+
+    // Configure GPIO interrupt
+    gpio_set_irq_enabled_with_callback(ISR_PIN, GPIO_IRQ_EDGE_FALL, true, &gpio_callback);
 
     ////////////////////////////////////////////////////////////////////////
     ///////////////////////// I2C CONFIGURATION ////////////////////////////
@@ -422,6 +602,7 @@ int main() {
 
     // start core 0
     pt_add_thread(protothread_serial);
+    pt_add_thread(protothread_gpio);
     pt_schedule_start ;
 
 }
